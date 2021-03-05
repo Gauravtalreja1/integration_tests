@@ -428,6 +428,7 @@ def test_variable_pass(request, appliance, setup_ansible_repository, import_data
         ],
     ).waiting(wait=600):
         # Ordering service catalog bundle
+        import ipdb; ipdb.set_trace()
         service_catalog.order()
         provision_request = appliance.collections.requests.instantiate(
             f"Provisioning Service [{catalog_item.name}] from [{catalog_item.name}]"

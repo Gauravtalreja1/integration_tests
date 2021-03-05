@@ -108,7 +108,6 @@ def dialog_with_catalog_item(appliance, request, ansible_repository, ansible_cat
 def ansible_linked_vm_action(appliance, ansible_catalog_item, create_vm):
     with update(ansible_catalog_item):
         ansible_catalog_item.provisioning = {"playbook": "add_single_vm_to_service.yml"}
-
     wait_for(lambda: create_vm.ip_address is not None)
 
     action_values = {
@@ -489,9 +488,10 @@ def test_service_ansible_playbook_plays_table(
     ansible_service_catalog.order()
     ansible_service_request.wait_for_request()
     view = navigate_to(ansible_service, "Details")
-    soft_assert(view.provisioning.plays.row_count > 1, "Plays table in provisioning tab is empty")
+    soft_assert(view.provisioning.plays.row_count >= 1, "Plays table in provisioning tab is empty")
     ansible_service.retire()
-    soft_assert(view.provisioning.plays.row_count > 1, "Plays table in retirement tab is empty")
+    view = navigate_to(ansible_service, "Details")
+    soft_assert(view.provisioning.plays.row_count >= 1, "Plays table in retirement tab is empty")
 
 
 @pytest.mark.tier(3)
@@ -728,13 +728,13 @@ def test_service_ansible_verbosity(
         tags: ansible_embed
     """
     # Adding index 0 which will give pattern for e.g. pattern = "verbosity"=>0.
-    pattern = fr'.*"verbosity"=>{verbosity[0]}.*'
+    pattern = fr".*verbosity: '{verbosity[0]}'.*"
     with update(ansible_catalog_item):
         ansible_catalog_item.provisioning = {"verbosity": verbosity}
         ansible_catalog_item.retirement = {"verbosity": verbosity}
 
     ansible_service_catalog.order()
-    with LogValidator("/var/www/miq/vmdb/log/automation.log",
+    with LogValidator("/var/www/miq/vmdb/log/evm.log",
                       matched_patterns=[pattern]).waiting(timeout=600):
         # Searching string '"verbosity"=>0' (example) in evm.log as Standard Output
         # is being logging in evm.log
@@ -750,21 +750,22 @@ def test_service_ansible_verbosity(
 
 @pytest.mark.tier(3)
 @pytest.mark.provider([VMwareProvider])
-@pytest.mark.meta(automates=[BZ(1448918)])
+@pytest.mark.usefixtures("setup_provider")
+@pytest.mark.parametrize("create_vm", ["full_template"], indirect=True)
+@pytest.mark.meta(automates=[BZ(1510797)])
 def test_ansible_service_linked_vm(
     appliance,
-    provider,
-    setup_provider,
+    create_vm,
     ansible_policy_linked_vm,
     ansible_service_request,
     ansible_service,
-    ansible_service_catalog,
-    ansible_catalog_item
+    ansible_catalog_item,
+    request
 ):
     """Check Whether service has associated VM attached to it.
 
     Bugzilla:
-        1448918
+        1510797
 
     Polarion:
         assignee: gtalreja
@@ -772,16 +773,12 @@ def test_ansible_service_linked_vm(
         initialEstimate: 1/3h
         tags: ansible_embed
     """
-    ansible_service_catalog.order()
-    service_vm = appliance.provider_based_collection(provider).instantiate(
-        name=f"{ansible_catalog_item.prov_data['catalog']['vm_name']}0001",
-        provider=provider
-    )
-    wait_for(lambda: ansible_service_request.exists, num_sec=60)
+    create_vm.add_tag()
+    wait_for(lambda: ansible_service_request.exists, num_sec=300)
     ansible_service_request.wait_for_request()
-
     view = navigate_to(ansible_service, "Details")
-    assert service_vm.name in view.entities.vms.all_entity_names
+    assert create_vm.name in view.entities.vms.all_entity_names
+    assert view.provisioning.results.get_text_of("Status") == "Finished"
 
 
 @pytest.mark.tier(1)
@@ -1062,3 +1059,120 @@ def test_embed_tower_order_service_extra_vars(request, appliance, ansible_reposi
     view.provisioning.extra_vars.variables_table[0].Actions.widget.delete.click()  # first row
     view.save.click()
     view.flash.assert_success_message(f"Catalog Item {cat_item.name} was saved")
+
+
+@pytest.mark.tier(2)
+@pytest.mark.meta(automates=[1858079])
+@pytest.mark.parametrize("become_method",
+    ["sudo", "su", "pbrun", "pfexec"],
+    ids=["become_method_sudo", "become_method_su", "become_method_pbrun", "become_method_pfexec"]
+)
+def test_ansible_service_escalate_privilege_without_become_passwd(request, appliance,
+ansible_repository, catalog, become_method):
+    """
+    Bugzilla:
+        1858079
+
+    Polarion:
+        assignee: gtalreja
+        casecomponent: Ansible
+        caseimportance: high
+        initialEstimate: 1/2h
+        tags: ansible_embed
+    """
+    creds = appliance.collections.ansible_credentials.create(
+        name=fauxfactory.gen_alpha(start="cred_"),
+        credential_type="Machine",
+        username=fauxfactory.gen_alpha(start="user_"),
+        password=fauxfactory.gen_alpha(start="pass_"),
+        privilage_escalation=f"{become_method}",
+        privilage_escalation_username="root",
+        privilage_escalation_password=""
+    )
+    @request.addfinalizer
+    def _finalize():
+        creds.delete_if_exists()
+        cat_item.delete_if_exists()
+        appliance.ssh_client.run_command("rm -f /var/tmp/test_touch_file_as_root.txt")
+
+    collection = appliance.collections.catalog_items
+    cat_item = collection.create(
+        collection.ANSIBLE_PLAYBOOK,
+        fauxfactory.gen_alphanumeric(),
+        fauxfactory.gen_alphanumeric(),
+        display_in_catalog=True,
+        catalog=catalog,
+        provisioning={
+            "repository": ansible_repository.name,
+            "playbook": "become_root_and_touch.yml",
+            "machine_credential": creds.name,
+            "create_new": True,
+            "provisioning_dialog_name": fauxfactory.gen_alphanumeric(),
+            "escalate_privilege": "Yes"
+        }
+    )
+    service_catalog = ServiceCatalogs(appliance, cat_item.catalog, cat_item.name)
+    service_catalog.order()
+    req_description = f"Provisioning Service [{cat_item.name}] from [{cat_item.name}]"
+    provision_request = appliance.collections.requests.instantiate(req_description)
+    provision_request.wait_for_request()
+    view = navigate_to(MyService(appliance, cat_item.name), "Details")
+    assert view.provisioning.results.get_text_of("Status") == "Finished"
+    assert not appliance.ssh_client.run_command("test -f /var/tmp/test_touch_file_as_root.txt").rc
+
+
+@pytest.mark.tier(2)
+@pytest.mark.meta(automates=[1858079])
+@pytest.mark.parametrize("become_method",
+    ["sudo", "su", "pbrun", "pfexec"],
+    ids=["become_method_sudo", "become_method_su", "become_method_pbrun", "become_method_pfexec"]
+)
+def test_ansible_service_escalate_privilege_without_become_password(request,
+appliance, ansible_catalog_item, ansible_service, ansible_service_catalog,
+ansible_service_request, become_method):
+    """
+    Bugzilla:
+        1858079
+
+    Polarion:
+        assignee: gtalreja
+        casecomponent: Ansible
+        caseimportance: high
+        initialEstimate: 1/2h
+        tags: ansible_embed
+        testSteps:
+          1. Enable EmbeddedAnsible server role.
+          2. Add your favourite repo with playbooks.
+          3. Create a new machine credential, with proper become_method
+             and that doesn't have a become password.
+          4. Create a Ansible Playbook service that checks above `Esclate Privileges`.
+          5. Run said playbook service
+        expectedResults:
+          1. Role should be enabled.
+          2. Check repo is added Successfully.
+          3. Ensure said become_password is `nil`, and Credentials are added
+          4.
+          5. Runs successfully without timing out.
+    """
+    creds = appliance.collections.ansible_credentials.create(
+        name=fauxfactory.gen_alpha(start="cred_"),
+        credential_type="Machine",
+        username=fauxfactory.gen_alpha(start="user_"),
+        password=fauxfactory.gen_alpha(start="pass_"),
+        privilage_escalation=f"{become_method}",
+        privilage_escalation_username="root",
+        privilage_escalation_password=""
+    )
+    request.addfinalizer(creds.delete_if_exists)
+    with update(ansible_catalog_item):
+        ansible_catalog_item.provisioning = {
+            "playbook": "become_root_and_touch.yml",
+            "machine_credential": creds.name,
+            "escalate_privilege": "Yes"
+        }
+    ansible_service_catalog.order()
+    ansible_service_request.wait_for_request()
+    view = navigate_to(ansible_service, "Details")
+    assert view.provisioning.results.get_text_of("Status") == "Finished"
+    check_file_exists = "test -f /var/tmp/test_touch_file_as_root.txt ; echo $?"
+    assert not appliance.ssh_client.run_command(check_file_exists).rc
